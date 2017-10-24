@@ -1,72 +1,36 @@
 # (c) 2011-2016 Dennis Kaarsemaker <dennis@kaarsemaker.net>
 # see COPYING for license details
 
-__version__ = "3.9"
+__version__ = "4.0"
 
 import codecs
+import io
 import os
 import errno
 import platform
 import random
 import re
 import socket
+import ssl
 import subprocess
 import sys
 import types
+import xml.etree.ElementTree as etree
 import warnings
 import hpilo_fw
 
 PY3 = sys.version_info[0] >= 3
 if PY3:
     import urllib.request as urllib2
-    import io
-    b = lambda x: bytes(x, 'ascii')
     class Bogus(Exception): pass
     socket.sslerror = Bogus
     basestring = str
 else:
     import urllib2
-    import cStringIO as io
-    if not hasattr(io, 'BytesIO'):
-        io.BytesIO = io.StringIO
-    b = lambda x: x
 
-try:
-    import ssl
-except ImportError:
-    # Fallback for older python versions
-    class ssl:
-        PROTOCOL_SSLv3   = 1
-        PROTOCOL_SSLv23  = 2
-        PROTOCOL_TLSv1   = 3
-        PROTOCOL_TLSv1_1 = 4
-        PROTOCOL_TLSv1_2 = 5
-        @staticmethod
-        def wrap_socket(sock, *args, **kwargs):
-            return ssl(sock)
-
-        def __init__(self, sock):
-            self.sock = sock
-            self.sslsock = socket.ssl(sock)
-
-        def read(self, n=None):
-            if not n:
-                return self.sslsock.read()
-            return self.sslsock.read(n)
-
-        def write(self, data):
-            return self.sslsock.write(data)
-
-        def shutdown(self, what):
-            return self.sock.shutdown(what)
-
-        def close(self):
-            return self.sock.close()
-
-try:
-    import xml.etree.ElementTree as etree
-except ImportError:
-    import elementtree.ElementTree as etree
+# Python 2.7.13 renamed PROTOCOL_SSLv23 to PROTOCOL_TLS
+if not hasattr(ssl, 'PROTOCOL_TLS'):
+    ssl.PROTOCOL_TLS = ssl.PROTOCOL_SSLv23
 
 # Oh the joys of monkeypatching...
 # - We need a CDATA element in set_security_msg, but ElementTree doesn't support it
@@ -100,7 +64,7 @@ if hasattr(etree, '_serialize_xml'):
             return
         return etree._original_serialize_xml(write, elem, *args, **kwargs)
     etree._serialize_xml = etree._serialize['xml'] = _serialize_xml
-# Python 2.5-2.6, and non-stdlib ElementTree
+# Python 2.6, and non-stdlib ElementTree
 elif hasattr(etree.ElementTree, '_write'):
     etree.ElementTree._orig_write = etree.ElementTree._write
     def _write(self, file, node, encoding, namespaces):
@@ -160,12 +124,6 @@ if PY3:
     # the manual way.
     IloError = IloErrorMeta('IloError', (Exception,), {'known_subclasses': [], '__init__': IloError.__init__})
 
-elif sys.version_info < (2,5,0):
-    # And in python 2.4, exceptions cannot be new style classes. So in python
-    # 2.4, you don't get nicely differentiated errors.
-    class IloError(Exception):
-        pass
-
 class IloCommunicationError(IloError):
     pass
 
@@ -211,21 +169,21 @@ class Ilo(object):
         connections. Set delayed to True to make python-hpilo not send requests
         immediately, but group them together. See :func:`call_delayed`"""
 
-    XML_HEADER = b('<?xml version="1.0"?>\r\n')
-    HTTP_HEADER = "POST /ribcl HTTP/1.1\r\nHost: localhost\r\nContent-Length: %d\r\nConnection: Close%s\r\n\r\n"
-    HTTP_UPLOAD_HEADER = "POST /cgi-bin/uploadRibclFiles HTTP/1.1\r\nHost: localhost\r\nConnection: Close\r\nContent-Length: %d\r\nContent-Type: multipart/form-data; boundary=%s\r\n\r\n"
+    XML_HEADER = b'<?xml version="1.0"?>\r\n'
+    HTTP_HEADER = b"POST /ribcl HTTP/1.1\r\nHost: localhost\r\nContent-Length: %d\r\nConnection: Close%s\r\n\r\n"
+    HTTP_UPLOAD_HEADER = b"POST /cgi-bin/uploadRibclFiles HTTP/1.1\r\nHost: localhost\r\nConnection: Close\r\nContent-Length: %d\r\nContent-Type: multipart/form-data; boundary=%s\r\n\r\n"
     BLOCK_SIZE = 64 * 1024
 
-    def __init__(self, hostname, login=None, password=None, timeout=60, port=443, protocol=None, delayed=False, ssl_version=None):
+    def __init__(self, hostname, login=None, password=None, timeout=60, port=443, protocol=None, delayed=False, ssl_verify=False, ssl_context=None):
         self.hostname = hostname
         self.login    = login or 'Administrator'
         self.password = password or 'Password'
         self.timeout  = timeout
         self.debug    = 0
         self.port     = port
-        self.ssl_version = ssl_version or ssl.PROTOCOL_TLSv1
-        self.ssl_fallback = ssl_version is None # Only fall back to SSLv3 if no protocol was specified
         self.protocol = protocol
+        self.ssl_verify = False
+        self.ssl_context = ssl_context
         self.cookie   = None
         self.delayed  = delayed
         self._elements = None
@@ -245,6 +203,13 @@ class Ilo(object):
             if os.access(maybe, os.X_OK):
                 self.hponcfg = maybe
                 break
+        if self.ssl_verify:
+            if sys.version_info < (2,7,9):
+                raise EnvironmentError("SSL verification only works with python 2.7.9 or newer")
+            if not self.ssl_context:
+                self.ssl_context = ssl.create_default_context()
+                # Sadly, ancient iLO's aren't dead yet, so let's enable sslv3 by default
+                self.ssl_context.options &= ~ssl.OP_NO_SSLv3
 
     def __str__(self):
         return "iLO interface of %s" % self.hostname
@@ -269,7 +234,7 @@ class Ilo(object):
 
         # Serialize the XML
         if hasattr(etree, 'tostringlist'):
-            xml = b("\r\n").join(etree.tostringlist(xml)) + b('\r\n')
+            xml = b"\r\n".join(etree.tostringlist(xml)) + b'\r\n'
         else:
             xml = etree.tostring(xml)
 
@@ -305,28 +270,29 @@ class Ilo(object):
         # Do a bogus request, using the HTTP protocol. If there is no
         # header (see special case in communicate(), we should be using the
         # raw protocol
-        header, data = self._communicate(b('<RIBCL VERSION="2.0"></RIBCL>'), ILO_HTTP, save=False)
+        header, data = self._communicate(b'<RIBCL VERSION="2.0"></RIBCL>', ILO_HTTP, save=False)
         if header:
             self.protocol = ILO_HTTP
         else:
             self.protocol = ILO_RAW
 
     def _upload_file(self, filename, progress):
-        firmware = open(filename, 'rb').read()
-        boundary = b('------hpiLO3t' + str(random.randint(100000,1000000)) + 'z')
+        with open(filename, 'rb') as fd:
+            firwmware = fd.read()
+        boundary = b'------hpiLO3t%dz' % random.randint(100000,1000000)
         while boundary in firmware:
-            boundary = b('------hpiLO3t' + str(random.randint(100000,1000000)) + 'z')
+            boundary = b'------hpiLO3t%dz' % str(random.randint(100000,1000000))
         parts = [
-            b("--") + boundary + b("""\r\nContent-Disposition: form-data; name="fileType"\r\n\r\n"""),
-            b("\r\n--") + boundary + b('''\r\nContent-Disposition: form-data; name="fwimgfile"; filename="''') + b(filename) + b('''"\r\nContent-Type: application/octet-stream\r\n\r\n'''),
+            b"""--%s\r\nContent-Disposition: form-data; name="fileType"\r\n\r\n""" % boundary,
+            b"""\r\n--%s\r\nContent-Disposition: form-data; name="fwimgfile"; filename="%s"\r\nContent-Type: application/octet-stream\r\n\r\n""" % (boundary, filename),
             firmware,
-            b("\r\n--") + boundary + b("--\r\n"),
+            b"\r\n--%s--\r\n" % boundary,
         ]
         total_bytes = sum([len(x) for x in parts])
         sock = self._get_socket()
 
-        self._debug(2, self.HTTP_UPLOAD_HEADER % (total_bytes, boundary.decode('ascii')))
-        sock.write(b(self.HTTP_UPLOAD_HEADER % (total_bytes, boundary.decode('ascii'))))
+        self._debug(2, self.HTTP_UPLOAD_HEADER % (total_bytes, boundary))
+        sock.write(self.HTTP_UPLOAD_HEADER % (total_bytes, boundary))
         for part in parts:
             if len(part) < self.BLOCK_SIZE:
                 self._debug(2, part)
@@ -351,10 +317,9 @@ class Ilo(object):
                 data += d.decode('ascii')
                 if not d:
                     break
-        except socket.sslerror: # Connection closed
-            e = sys.exc_info()[1]
+        except socket.sslerror as exc: # Connection closed
             if not data:
-                raise IloCommunicationError("Communication with %s:%d failed: %s" % (self.hostname, self.port, str(e)))
+                raise IloCommunicationError("Communication with %s:%d failed: %s" % (self.hostname, self.port, str(exc)))
 
         self._debug(1, "Received %d bytes" % len(data))
         self._debug(2, data)
@@ -379,7 +344,7 @@ class Ilo(object):
                     self.write = self.output.write
                     data = self.input.read(4)
                     self.input.seek(0)
-                    self.protocol = data == b('HTTP') and ILO_HTTP or ILO_RAW
+                    self.protocol = data == b'HTTP' and ILO_HTTP or ILO_RAW
                 def close(self):
                     self.input.close()
                     self.output.close()
@@ -393,9 +358,8 @@ class Ilo(object):
             self._debug(1, "Launching hponcfg")
             try:
                 sp = subprocess.Popen([self.hponcfg, '--input', '--xmlverbose'], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            except OSError:
-                e = sys.exc_info()[1]
-                raise IloCommunicationError("Cannot run %s: %s" % (self.hponcfg, str(e)))
+            except OSError as exc:
+                raise IloCommunicationError("Cannot run %s: %s" % (self.hponcfg, str(exc)))
             sp.write = sp.stdin.write
             sp.read = sp.stdout.read
             return sp
@@ -414,11 +378,10 @@ class Ilo(object):
                 if sock is not None:
                     sock.close()
                 err = IloCommunicationError("Timeout connecting to %s port %d" % (self.hostname, self.port))
-            except socket.error:
+            except socket.error as exc:
                 if sock is not None:
                     sock.close()
-                e = sys.exc_info()[1]
-                err = IloCommunicationError("Error connecting to %s port %d: %s" % (self.hostname, self.port, str(e)))
+                err = IloCommunicationError("Error connecting to %s port %d: %s" % (self.hostname, self.port, str(exc)))
 
         if err is not None:
             raise err
@@ -427,15 +390,12 @@ class Ilo(object):
             raise IloCommunicationError("Unable to resolve %s" % self.hostname)
 
         try:
-            return ssl.wrap_socket(sock, ssl_version=self.ssl_version)
-        except socket.sslerror:
-            e = sys.exc_info()[1]
-            msg = getattr(e, 'reason', None) or getattr(e, 'message', None) or str(e)
-            # Some ancient iLO's don't support TLSv1, retry with SSLv3
-            if 'wrong version number' in msg and self.ssl_version >= ssl.PROTOCOL_TLSv1 and self.ssl_fallback:
-                self.ssl_version = ssl.PROTOCOL_SSLv3
-                return self._get_socket()
-            raise IloCommunicationError("Cannot establish ssl session with %s:%d: %s" % (self.hostname, self.port, msg))
+            if self.ssl_context:
+                return self.ssl_context.wrap_socket(sock, server_hostname=self.hostname)
+            else:
+                return ssl.wrap_socket(sock, ssl_version=ssl.PROTOCOL_TLS)
+        except ssl.SSLError as exc:
+            raise IloCommunicationError("Cannot establish ssl session with %s:%d: %s" % (self.hostname, self.port, str(exc)))
 
     def _communicate(self, xml, protocol, progress=None, save=True):
         sock = self._get_socket()
@@ -452,19 +412,20 @@ class Ilo(object):
 
         if protocol == ILO_HTTP:
             self._debug(2, http_header)
-            sock.write(b(http_header))
+            sock.write(http_header)
 
         self._debug(2, self.XML_HEADER + xml)
 
         # XML header and data need to arrive in 2 distinct packets
         if self.protocol != ILO_LOCAL:
             sock.write(self.XML_HEADER)
-        if b('$EMBED') in xml:
-            pre, name, post = re.compile(b(r'(.*)\$EMBED:(.*)\$(.*)'), re.DOTALL).match(xml).groups()
+        if '$EMBED' in xml:
+            pre, name, post = re.compile(b'(.*)\$EMBED:(.*)\$(.*)', re.DOTALL).match(xml).groups()
             sock.write(pre)
             sent = 0
             fwlen = os.path.getsize(name)
-            fw = open(name, 'rb').read()
+            with open(name, 'rb') as fd:
+                fw = fd.read()
             while sent < fwlen:
                 written = sock.write(fw[sent:sent+self.BLOCK_SIZE])
                 sent += written
@@ -502,10 +463,9 @@ class Ilo(object):
                             if msg:
                                 progress(msg)
                             d = d[end:]
-        except socket.sslerror: # Connection closed
-            e = sys.exc_info()[1]
+        except socket.sslerror as exc: # Connection closed
             if not data:
-                raise IloCommunicationError("Communication with %s:%d failed: %s" % (self.hostname, self.port, str(e)))
+                raise IloCommunicationError("Communication with %s:%d failed: %s" % (self.hostname, self.port, str(exc)))
 
         self._debug(1, "Received %d bytes" % len(data))
         if self.protocol == ILO_LOCAL:
@@ -515,8 +475,7 @@ class Ilo(object):
             # On OSX this may cause an ENOTCONN, Linux/Windows ignore that situation
             try:
                 sock.shutdown(socket.SHUT_RDWR)
-            except socket.error:
-                exc = sys.exc_info()[1]
+            except socket.error as exc:
                 if exc.errno == errno.ENOTCONN:
                     pass
                 else:
@@ -528,9 +487,8 @@ class Ilo(object):
             data = data[data.find('<'):data.rfind('>')+1]
 
         if self.save_response and save:
-            fd = open(self.save_response, 'a')
-            fd.write(data)
-            fd.close()
+            with open(self.save_response, 'a') as fd:
+                fd.write(data)
 
         # Do we have HTTP?
         header_ = ''
@@ -1401,8 +1359,11 @@ class Ilo(object):
         """Modify iLO global settings, only values that are specified will be changed."""
         vars = dict(locals())
         del vars['self']
+        dont_map = ['authentication_failure_logging']
         elements = [etree.Element(x.upper(), VALUE=str({True: 'Yes', False: 'No'}.get(vars[x], vars[x])))
-                    for x in vars if vars[x] is not None]
+                    for x in vars if vars[x] is not None and x not in dont_map] + \
+                   [etree.Element(x.upper(), VALUE=str(vars[x]))
+                    for x in vars if vars[x] is not None and x in dont_map]
         return self._control_tag('RIB_INFO', 'MOD_GLOBAL_SETTINGS', elements=elements)
 
     def mod_network_settings(self, enable_nic=None, reg_ddns_server=None,
@@ -1424,7 +1385,8 @@ class Ilo(object):
             ipv6_reg_ddns_server=None, dhcpv6_dns_server=None, dhcpv6_rapid_commit=None,
             dhcpv6_stateful_enable=None, dhcpv6_stateless_enable=None, dhcpv6_sntp_settings=None,
             dhcpv6_domain_name=None, ilo_nic_auto_select=None, ilo_nic_auto_snp_scan=None,
-            ilo_nic_auto_delay=None, ilo_nic_fail_over=None, gratuitous_arp=None):
+            ilo_nic_auto_delay=None, ilo_nic_fail_over=None, gratuitous_arp=None,
+            nic_fail_over_delay=None):
         """Configure the network settings for the iLO card. The static route arguments require
            dicts as arguments. The necessary keys in these dicts are dest,
            gateway and mask all in dotted-quad form"""
@@ -1614,7 +1576,7 @@ class Ilo(object):
         """Delet the specified deployment profile"""
         return self._control_tag('RIB_INFO', 'PROFILE_DELETE', elements=[etree.Element('PROFILE_DESC_NAME', attrib={'VALUE': desc_name})])
 
-    def profile_desc_download(self, desc_name, name, description, blob_namespace=None, blob_name=None, url=None):
+    def profile_desc_download(self, desc_name, name, description, blob_namespace='perm', blob_name=None, url=None):
         """Make the iLO download a blob and create a deployment profile"""
         elements = [
             etree.Element('PROFILE_DESC_NAME', attrib={'VALUE': desc_name}),
@@ -1623,11 +1585,13 @@ class Ilo(object):
             etree.Element('PROFILE_SCHEMA', attrib={'VALUE': 'intelligentprovisioning.1.0.0'}),
         ]
         if blob_namespace:
-            elements.append(etree.Element('BLOB_NAMESPACE', attrs={'VALUE': blob_namespace}))
+            elements.append(etree.Element('BLOB_NAMESPACE', attrib={'VALUE': blob_namespace}))
         if blob_name:
-            elements.append(etree.Element('BLOB_NAME', attrs={'VALUE': blob_name}))
+            elements.append(etree.Element('BLOB_NAME', attrib={'VALUE': blob_name}))
+        else:
+            elements.append(etree.Element('BLOB_NAME', attrib={'VALUE': desc_name}))
         if url:
-            elements.append(etree.Element('PROFILE_URL', attrs={'VALUE': url}))
+            elements.append(etree.Element('PROFILE_URL', attrib={'VALUE': url}))
         return self._control_tag('RIB_INFO', 'PROFILE_DESC_DOWNLOAD', elements=elements)
 
     def profile_list(self):
@@ -1671,7 +1635,7 @@ class Ilo(object):
         """Set the server asset tag"""
         return self._control_tag('SERVER_INFO', 'SET_ASSET_TAG', attrib={'VALUE': asset_tag})
 
-    def set_ers_direct_connect(self, user_id, password, proxy_host=None,
+    def set_ers_direct_connect(self, user_id, password, proxy_url=None,
             proxy_port=None, proxy_username=None, proxy_password=None):
         """Register your iLO with HP Insigt Online using Direct Connect. Note
            that you must also call dc_registration_complete"""
@@ -1692,7 +1656,7 @@ class Ilo(object):
         ]
         return self._control_tag('RIB_INFO', 'SET_ERS_IRS_CONNECT', elements=elements)
 
-    def set_ers_web_proxy(self, proxy_host, proxy_port, proxy_username=None,
+    def set_ers_web_proxy(self, proxy_url, proxy_port, proxy_username=None,
             proxy_password=None):
         """Register your iLO with HP Insigt Online using Direct Connect. Note
            that you must also call dc_registration_complete"""
@@ -1919,9 +1883,8 @@ class Ilo(object):
             raise IloError("unsupported xmldata argument '%s', must be 'all' or 'cpqkey'" % item)
 
         if self.read_response:
-            fd = open(self.read_response)
-            data = fd.read()
-            fd.close()
+            with open(self.read_response) as fd:
+                data = fd.read()
         else:
             url = 'https://%s:%s/xmldata?item=%s' % (self.hostname, self.port, item)
             if hasattr(ssl, 'create_default_context'):
